@@ -1,11 +1,15 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE TypeApplications #-}
 
 -- | Configuration options used by the tool.
 module Ormolu.Config
@@ -26,22 +30,27 @@ module Ormolu.Config
     regionIndicesToDeltas,
     DynOption (..),
     dynOptionToLocatedStr,
+    ToCLIArgument (..),
+    FromCLIArgument (..),
+    OptionDescription (..),
+    printerOptsDescr,
+    showAllValues
   )
 where
 
+import Control.Monad(mzero)
 import Data.Aeson
   ( FromJSON (..),
-    camelTo2,
-    constructorTagModifier,
-    defaultOptions,
-    fieldLabelModifier,
-    genericParseJSON,
+    Value (..),
+    (.:?),
+    (.:)
   )
+import Data.Aeson.Types (typeMismatch,Parser)
 import qualified Data.ByteString.Lazy as BS
-import Data.Char (isLower)
 import Data.Functor.Identity (Identity (..))
 import Data.YAML (Pos)
 import Data.YAML.Aeson (decode1)
+import Data.Text(pack, unpack, Text)
 import GHC.Generics (Generic)
 import qualified SrcLoc as GHC
 import System.Directory
@@ -186,24 +195,10 @@ data CommaStyle
   | Trailing
   deriving (Eq, Ord, Show, Generic, Bounded, Enum)
 
-instance FromJSON CommaStyle where
-  parseJSON =
-    genericParseJSON
-      defaultOptions
-        { constructorTagModifier = camelTo2 '-'
-        }
-
 data HaddockPrintStyle
   = HaddockSingleLine
   | HaddockMultiLine
   deriving (Eq, Ord, Show, Generic, Bounded, Enum)
-
-instance FromJSON HaddockPrintStyle where
-  parseJSON =
-    genericParseJSON
-      defaultOptions
-        { constructorTagModifier = drop (length "haddock-") . camelTo2 '-'
-        }
 
 -- | Convert 'RegionIndices' into 'RegionDeltas'.
 regionIndicesToDeltas ::
@@ -230,11 +225,18 @@ dynOptionToLocatedStr :: DynOption -> GHC.Located String
 dynOptionToLocatedStr (DynOption o) = GHC.L GHC.noSrcSpan o
 
 instance FromJSON PrinterOptsPartial where
-  parseJSON =
-    genericParseJSON
-      defaultOptions
-        { fieldLabelModifier = camelTo2 '-' . dropWhile isLower
-        }
+  parseJSON (Object v) =
+    PrinterOpts <$>
+      o poIndentation <*>
+      o poCommaStyle <*>
+      o poIndentWheres <*>
+      o poRecordBraceSpace <*>
+      o poDiffFriendlyImportExport <*>
+      o poRespectful <*>
+      o poHaddockStyle <*>
+      o poNewlinesBetweenDecls
+    where o f = v .:? (pack . odName . f $ printerOptsDescr)
+  parseJSON _ = fail "Incorrect configuration file."
 
 -- | Read options from a config file, if found.
 -- Looks recursively in parent folders, then in 'XdgConfig',
@@ -261,3 +263,108 @@ data ConfigFileLoadResult
 -- | Expected file name for YAML config.
 configFileName :: FilePath
 configFileName = "fourmolu.yaml"
+
+data OptionDescription a = OptionDescription
+  {
+  odName :: String,
+  odMetavar :: String,
+  odHelp :: String
+  }
+
+printerOptsDescr :: PrinterOpts OptionDescription
+printerOptsDescr = PrinterOpts
+  {
+    poIndentation = OptionDescription
+      "indentation"
+      "WIDTH"
+      "Number of spaces per indentation step"
+    ,poCommaStyle = OptionDescription
+      "comma-style"
+      "STYLE"
+      ("How to place commas in multi-line lists, records etc: "
+        <> (showAllValues @CommaStyle))
+    ,poIndentWheres = OptionDescription
+      "indent-wheres"
+      "BOOL"
+      ("Whether to indent 'where' bindings past the preceding body"
+        <> " (rather than half-indenting the 'where' keyword)")
+    ,poRecordBraceSpace = OptionDescription
+      "record-brace-space"
+      "BOOL"
+      "Whether to leave a space before an opening record brace"
+    ,poDiffFriendlyImportExport = OptionDescription
+      "diff-friendly-import-export"
+      "BOOL"
+      ("Whether to make use of extra commas in import/export lists"
+        <> " (as opposed to Ormolu's style)")
+    ,poRespectful = OptionDescription
+      "respectful"
+      "BOOL"
+      "Give the programmer more choice on where to insert blank lines"
+    ,poHaddockStyle = OptionDescription
+      "haddock-style"
+      "STYLE"
+      ("How to print Haddock comments: "
+        <> (showAllValues @HaddockPrintStyle))
+     ,poNewlinesBetweenDecls = OptionDescription
+      "newlines-between-decls"
+      "HEIGHT"
+      "Number of spaces between top-level declarations"
+  }
+
+-- | Values that appear as arguments of CLI options and thus have
+-- a corresponding textual representation.
+class ToCLIArgument a where
+  -- | Convert a value to its representation as a CLI option argument.
+  toCLIArgument :: a -> String
+
+  -- | Convert a value to its representation as a CLI option argument wrapped
+  -- in apostrophes.
+  toCLIArgument' :: a -> String
+  toCLIArgument' x = "'" <> toCLIArgument x <> "'"
+
+class FromCLIArgument a where
+  fromCLIArgument :: String -> Maybe a
+
+  fromCLIArgument' :: Text -> Maybe a
+  fromCLIArgument' = fromCLIArgument . unpack
+
+  stdParseJSON :: String -> Value -> Parser a
+  stdParseJSON _ (Object o)  = do
+    tag <- o .: "tag"
+    case fromCLIArgument' tag of
+        Just v -> return v
+        Nothing -> mzero
+  stdParseJSON typeName v = typeMismatch typeName v
+
+instance (Enum a, Bounded a, ToCLIArgument a) => FromCLIArgument a where
+  fromCLIArgument s = lookup s $ map (\x -> (toCLIArgument x, x)) [minBound ..]
+
+instance ToCLIArgument Int where
+  toCLIArgument = show
+
+instance ToCLIArgument Bool where
+  toCLIArgument True = "true"
+  toCLIArgument False = "false"
+
+instance ToCLIArgument CommaStyle where
+  toCLIArgument Leading = "leading"
+  toCLIArgument Trailing = "trailing"
+
+instance ToCLIArgument HaddockPrintStyle where
+  toCLIArgument HaddockSingleLine = "single-line"
+  toCLIArgument HaddockMultiLine = "multi-line"
+
+instance FromJSON CommaStyle where
+  parseJSON = stdParseJSON "CommaStyle"
+
+instance FromJSON HaddockPrintStyle where
+  parseJSON = stdParseJSON "HaddockPrintStyle"
+
+showAllValues :: forall a. (Enum a, Bounded a, ToCLIArgument a) => String
+showAllValues = format (map toCLIArgument' [(minBound :: a) ..])
+  where
+    format [] = []
+    format [x] = x
+    format [x1, x2] = x1 <> " or " <> x2
+    format (x : xs) = x <> ", " <> format xs
